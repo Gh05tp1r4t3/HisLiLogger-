@@ -131,96 +131,147 @@ class RecentlyUsedExtractor(ForensicExtractor):
 
 
 class BrowserHistoryExtractor(ForensicExtractor):
-    FIREFOX_BASE = ".mozilla/firefox"
-    CHROME_PATHS = [
-        ".config/google-chrome/Default/History",
-        ".config/chromium/Default/History",
-        ".config/BraveSoftware/Brave-Browser/Default/History",
+    # Firefox-based browsers: (profile_base_dir, display_name)
+    FIREFOX_BASED = [
+        (".mozilla/firefox",                            "Firefox"),
+        (".librewolf",                                  "LibreWolf"),
+        (".waterfox",                                   "Waterfox"),
+        (".floorp",                                     "Floorp"),
+        (".zen-browser",                                "Zen Browser"),
+    ]
+
+    # Chromium-based browsers: (relative_history_path, display_name)
+    # Each entry may include multiple profile patterns (Default, Profile 1, etc.)
+    CHROMIUM_BASED = [
+        (".config/google-chrome",                       "Google Chrome"),
+        (".config/chromium",                            "Chromium"),
+        (".config/BraveSoftware/Brave-Browser",         "Brave"),
+        (".config/microsoft-edge",                      "Microsoft Edge"),
+        (".config/opera",                               "Opera"),
+        (".config/vivaldi",                             "Vivaldi"),
+        (".config/thorium",                             "Thorium"),
+        (".config/ungoogled-chromium",                  "Ungoogled Chromium"),
     ]
 
     def extract(self):
-        self.results = self._extract_firefox() + self._extract_chrome_based()
+        self.results = self._extract_firefox_based() + self._extract_chromium_based()
         return self.results
 
-    def _extract_firefox(self):
+    def _extract_firefox_based(self):
         entries = []
-        ff_dir = self.home_dir / self.FIREFOX_BASE
-        if not ff_dir.exists():
-            return entries
-        for profile in ff_dir.iterdir():
-            db_path = profile / "places.sqlite"
-            if not db_path.exists():
+        for base_rel, browser_name in self.FIREFOX_BASED:
+            ff_dir = self.home_dir / base_rel
+            if not ff_dir.exists():
                 continue
-            fh = self.file_hash(str(db_path))
-            tmp = tempfile.mktemp(suffix=".sqlite")
-            shutil.copy2(str(db_path), tmp)
-            try:
-                conn = sqlite3.connect(tmp)
-                conn.row_factory = sqlite3.Row
-                for row in conn.execute(
-                    "SELECT url,title,visit_count,last_visit_date FROM moz_places "
-                    "WHERE visit_count>0 ORDER BY last_visit_date DESC LIMIT 500"
-                ):
-                    vt = ""
-                    if row["last_visit_date"]:
-                        try:
-                            vt = (datetime.datetime(1970,1,1) +
-                                  datetime.timedelta(microseconds=int(row["last_visit_date"]))
-                                  ).strftime("%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            vt = str(row["last_visit_date"])
-                    entries.append({
-                        "source": str(db_path), "source_type": "Firefox History",
-                        "profile": profile.name, "url": row["url"],
-                        "title": row["title"] or "", "visit_count": row["visit_count"],
-                        "last_visit": vt, "file_hash": fh,
-                        "extracted_at": datetime.datetime.now().isoformat(),
-                    })
-                conn.close()
-            except Exception as e:
-                self.errors.append(f"Firefox error: {e}")
-            finally:
-                try: os.unlink(tmp)
-                except: pass
+            for profile in ff_dir.iterdir():
+                db_path = profile / "places.sqlite"
+                if not db_path.exists():
+                    continue
+                fh = self.file_hash(str(db_path))
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite")
+                tmp = tmp_file.name
+                tmp_file.close()
+                shutil.copy2(str(db_path), tmp)
+                try:
+                    conn = sqlite3.connect(tmp)
+                    conn.row_factory = sqlite3.Row
+                    for row in conn.execute(
+                        "SELECT url,title,visit_count,last_visit_date FROM moz_places "
+                        "WHERE visit_count>0 ORDER BY last_visit_date DESC LIMIT 500"
+                    ):
+                        vt = ""
+                        if row["last_visit_date"]:
+                            try:
+                                vt = (datetime.datetime(1970, 1, 1) +
+                                      datetime.timedelta(microseconds=int(row["last_visit_date"]))
+                                      ).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                vt = str(row["last_visit_date"])
+                        entries.append({
+                            "source": str(db_path),
+                            "source_type": f"{browser_name} History",
+                            "profile": profile.name,
+                            "url": row["url"],
+                            "title": row["title"] or "",
+                            "visit_count": row["visit_count"],
+                            "last_visit": vt,
+                            "file_hash": fh,
+                            "extracted_at": datetime.datetime.now().isoformat(),
+                        })
+                    conn.close()
+                except Exception as e:
+                    self.errors.append(f"{browser_name} error ({profile.name}): {e}")
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except Exception:
+                        pass
         return entries
 
-    def _extract_chrome_based(self):
+    def _extract_chromium_based(self):
         entries = []
-        for rel in self.CHROME_PATHS:
-            db_path = self.home_dir / rel
-            if not db_path.exists():
+        for base_rel, browser_name in self.CHROMIUM_BASED:
+            base_dir = self.home_dir / base_rel
+            if not base_dir.exists():
                 continue
-            name = "Chrome" if "google-chrome" in rel else ("Brave" if "Brave" in rel else "Chromium")
-            fh = self.file_hash(str(db_path))
-            tmp = tempfile.mktemp(suffix=".sqlite")
-            shutil.copy2(str(db_path), tmp)
+            # Collect all profile directories (Default, Profile 1, Profile 2, ...)
+            profile_dirs = []
+            default_db = base_dir / "Default" / "History"
+            if default_db.exists():
+                profile_dirs.append((base_dir / "Default", "Default"))
             try:
-                conn = sqlite3.connect(tmp)
-                conn.row_factory = sqlite3.Row
-                for row in conn.execute(
-                    "SELECT url,title,visit_count,last_visit_time FROM urls "
-                    "ORDER BY last_visit_time DESC LIMIT 500"
-                ):
-                    vt = ""
-                    if row["last_visit_time"]:
-                        try:
-                            vt = (datetime.datetime(1601,1,1) +
-                                  datetime.timedelta(microseconds=int(row["last_visit_time"]))
-                                  ).strftime("%Y-%m-%d %H:%M:%S")
-                        except: vt = str(row["last_visit_time"])
-                    entries.append({
-                        "source": str(db_path), "source_type": f"{name} History",
-                        "url": row["url"], "title": row["title"] or "",
-                        "visit_count": row["visit_count"], "last_visit": vt,
-                        "file_hash": fh,
-                        "extracted_at": datetime.datetime.now().isoformat(),
-                    })
-                conn.close()
-            except Exception as e:
-                self.errors.append(f"{name} error: {e}")
-            finally:
-                try: os.unlink(tmp)
-                except: pass
+                for item in base_dir.iterdir():
+                    if item.is_dir() and item.name.startswith("Profile "):
+                        db = item / "History"
+                        if db.exists():
+                            profile_dirs.append((item, item.name))
+            except (PermissionError, OSError):
+                pass
+
+            for profile_dir, profile_name in profile_dirs:
+                db_path = profile_dir / "History"
+                if not db_path.exists():
+                    continue
+                fh = self.file_hash(str(db_path))
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite")
+                tmp = tmp_file.name
+                tmp_file.close()
+                shutil.copy2(str(db_path), tmp)
+                try:
+                    conn = sqlite3.connect(tmp)
+                    conn.row_factory = sqlite3.Row
+                    for row in conn.execute(
+                        "SELECT url,title,visit_count,last_visit_time FROM urls "
+                        "ORDER BY last_visit_time DESC LIMIT 500"
+                    ):
+                        vt = ""
+                        if row["last_visit_time"]:
+                            try:
+                                # Chromium epoch: microseconds since 1601-01-01
+                                vt = (datetime.datetime(1601, 1, 1) +
+                                      datetime.timedelta(microseconds=int(row["last_visit_time"]))
+                                      ).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                vt = str(row["last_visit_time"])
+                        entries.append({
+                            "source": str(db_path),
+                            "source_type": f"{browser_name} History",
+                            "profile": profile_name,
+                            "url": row["url"],
+                            "title": row["title"] or "",
+                            "visit_count": row["visit_count"],
+                            "last_visit": vt,
+                            "file_hash": fh,
+                            "extracted_at": datetime.datetime.now().isoformat(),
+                        })
+                    conn.close()
+                except Exception as e:
+                    self.errors.append(f"{browser_name} ({profile_name}) error: {e}")
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except Exception:
+                        pass
         return entries
 
 
@@ -375,23 +426,38 @@ class SQLiteFreelistRecovery(ForensicExtractor):
 
     def _find_db_files(self):
         paths = []
-        # Firefox
-        ff_base = self.home_dir / ".mozilla/firefox"
-        if ff_base.exists():
+        # Firefox-based browsers
+        firefox_bases = [
+            ".mozilla/firefox", ".librewolf", ".waterfox", ".floorp", ".zen-browser",
+        ]
+        for base_rel in firefox_bases:
+            ff_base = self.home_dir / base_rel
+            if not ff_base.exists():
+                continue
             for profile in ff_base.iterdir():
                 for db in ["places.sqlite", "formhistory.sqlite", "downloads.sqlite"]:
                     p = profile / db
                     if p.exists():
                         paths.append(p)
-        # Chrome/Chromium/Brave
-        for rel in [
-            ".config/google-chrome/Default/History",
-            ".config/chromium/Default/History",
-            ".config/BraveSoftware/Brave-Browser/Default/History",
-        ]:
-            p = self.home_dir / rel
-            if p.exists():
-                paths.append(p)
+        # Chromium-based browsers — scan Default + numbered profiles
+        chromium_bases = [
+            ".config/google-chrome",
+            ".config/chromium",
+            ".config/BraveSoftware/Brave-Browser",
+            ".config/microsoft-edge",
+            ".config/opera",
+            ".config/vivaldi",
+            ".config/thorium",
+            ".config/ungoogled-chromium",
+        ]
+        for base_rel in chromium_bases:
+            base_dir = self.home_dir / base_rel
+            if not base_dir.exists():
+                continue
+            for profile_name in ["Default"] + [f"Profile {i}" for i in range(1, 6)]:
+                p = base_dir / profile_name / "History"
+                if p.exists():
+                    paths.append(p)
         return paths
 
     def _carve_db(self, db_path: Path) -> list:
@@ -992,13 +1058,13 @@ class HisLiLoggerApp:
         # ─ Config bar ─
         self._build_config_bar()
 
-        # ─ Two-notebook layout: Standard | Advanced ─
-        outer = ttk.Frame(self.root)
-        outer.pack(fill="both", expand=True, padx=20, pady=(0,2))
+        # ─ Two-notebook layout: Standard | Advanced — split by draggable sash ─
+        paned = ttk.PanedWindow(self.root, orient="vertical")
+        paned.pack(fill="both", expand=True, padx=20, pady=(0,2))
 
-        # Section labels
-        lf_std = ttk.Frame(outer)
-        lf_std.pack(fill="both", expand=True)
+        # ── Standard pane ──
+        lf_std = ttk.Frame(paned)
+        paned.add(lf_std, weight=1)
 
         std_hdr = ttk.Frame(lf_std, style="Panel.TFrame")
         std_hdr.pack(fill="x")
@@ -1026,12 +1092,9 @@ class HisLiLoggerApp:
         self._build_keywords_tab()
         self._build_log_tab()
 
-        # ── Separator ──
-        tk.Frame(self.root, bg=c["warn"], height=1).pack(fill="x", padx=20, pady=2)
-
-        # ── Advanced notebook ──
-        lf_adv = ttk.Frame(self.root)
-        lf_adv.pack(fill="both", expand=True, padx=20, pady=(0,2))
+        # ── Advanced pane ──
+        lf_adv = ttk.Frame(paned)
+        paned.add(lf_adv, weight=1)
 
         adv_hdr = ttk.Frame(lf_adv, style="Panel.TFrame")
         adv_hdr.pack(fill="x")
@@ -1091,7 +1154,7 @@ class HisLiLoggerApp:
 
     def _build_browser_tab(self):
         self.browser_tree = self._make_tree(self.tab_browser,
-            ("Browser", "Title", "Visits", "Last Visit", "URL"), (110, 230, 55, 150, 360))
+            ("Browser", "Profile", "Title", "Visits", "Last Visit", "URL"), (130, 90, 200, 55, 150, 360))
 
     def _build_keywords_tab(self):
         top = ttk.Frame(self.tab_keywords)
@@ -1209,7 +1272,10 @@ class HisLiLoggerApp:
 
     def _run_all(self):
         self._set_status("Running all modules...")
-        threading.Thread(target=lambda: (self._std_worker(), self._adv_worker()), daemon=True).start()
+        def _all_worker():
+            self._std_worker()
+            self._adv_worker()
+        threading.Thread(target=_all_worker, daemon=True).start()
 
     def _run_standard(self):
         self._set_status("Running standard extraction...")
@@ -1244,17 +1310,31 @@ class HisLiLoggerApp:
 
         self._log("\n[3] Browser History...")
         ext3 = BrowserHistoryExtractor(home)
+        # Log every path checked so the Forensic Log shows exactly what was found/missing
+        for base_rel, bname in ext3.FIREFOX_BASED:
+            p = Path(home) / base_rel
+            self._log(f"  [FF ] {bname}: {'FOUND' if p.exists() else 'not found'}  ({p})")
+        for base_rel, bname in ext3.CHROMIUM_BASED:
+            p = Path(home) / base_rel
+            self._log(f"  [CR ] {bname}: {'FOUND' if p.exists() else 'not found'}  ({p})")
         self.browser_entries = ext3.extract()
         for e in ext3.errors: self._log(f"  WARN: {e}")
-        self._log(f"  → {len(self.browser_entries)} URLs")
+        per_browser = Counter(e["source_type"] for e in self.browser_entries)
+        for bname, cnt in per_browser.items():
+            self._log(f"  → {bname}: {cnt} URLs")
+        self._log(f"  → TOTAL: {len(self.browser_entries)} URLs")
 
         self._log("\n[4] Keyword Dictionary...")
+        try:
+            min_len = self.min_keyword_len.get()
+        except Exception:
+            min_len = 3
         sources = (
             [e.get("command","") for e in self.shell_entries]
-            + [e.get("filename","") for e in self.recent_entries]
+            + [e.get("filename","") + " " + e.get("file_uri","") for e in self.recent_entries]
             + [e.get("url","")+" "+e.get("title","") for e in self.browser_entries]
         )
-        self.keyword_dict = KeywordDictionaryBuilder(self.min_keyword_len.get()).build(sources)
+        self.keyword_dict = KeywordDictionaryBuilder(min_len).build(sources)
         self._log(f"  → {len(self.keyword_dict)} keywords")
         self._log("[STANDARD COMPLETE]")
 
@@ -1317,7 +1397,8 @@ class HisLiLoggerApp:
         self._clear_tree(self.browser_tree)
         for e in self.browser_entries:
             self.browser_tree.insert("","end", values=(
-                e["source_type"], e.get("title","")[:50],
+                e["source_type"], e.get("profile",""),
+                e.get("title","")[:50],
                 e.get("visit_count",""), e.get("last_visit",""), e.get("url","")))
 
         self._clear_tree(self.kw_tree)
@@ -1393,7 +1474,7 @@ class HisLiLoggerApp:
                 if mode in ("browser","all") and self.browser_entries:
                     f.write(f"\n{'─'*60}\n  BROWSER HISTORY ({len(self.browser_entries)})\n{'─'*60}\n")
                     for e in self.browser_entries:
-                        f.write(f"[{e['source_type']}][{e.get('last_visit','')}][v:{e.get('visit_count','')}]  {e.get('url','')}\n")
+                        f.write(f"[{e['source_type']}][{e.get('profile','')}][{e.get('last_visit','')}][v:{e.get('visit_count','')}]  {e.get('url','')}\n")
             self._log(f"[EXPORT] {mode} → {path}")
             messagebox.showinfo("Saved", f"Saved:\n{path}")
         except Exception as ex:
@@ -1442,7 +1523,11 @@ class HisLiLoggerApp:
             initialfile=f"keywords_{datetime.date.today()}.txt")
         if not path: return
         try:
-            KeywordDictionaryBuilder(self.min_keyword_len.get()).export_txt(self.keyword_dict, path)
+            try:
+                min_len = self.min_keyword_len.get()
+            except Exception:
+                min_len = 3
+            KeywordDictionaryBuilder(min_len).export_txt(self.keyword_dict, path)
             messagebox.showinfo("Saved", f"Keywords saved:\n{path}")
         except Exception as ex:
             messagebox.showerror("Export Error", str(ex))
@@ -1490,7 +1575,7 @@ class HisLiLoggerApp:
                     ("RECENTLY USED FILES", self.recent_entries,
                      lambda e: f"  {e.get('visited','')[:19]:20}  {e['file_uri']}"),
                     ("BROWSER HISTORY", self.browser_entries,
-                     lambda e: f"  [{e['source_type']}] {e.get('last_visit','')}  {e.get('url','')}"),
+                     lambda e: f"  [{e['source_type']}][{e.get('profile','')}] {e.get('last_visit','')}  {e.get('url','')}"),
                     ("[ADV-1] /proc/fd DELETED HISTORY", self.proc_fd_entries,
                      lambda e: f"  PID:{e.get('pid','')} {e.get('status','')}  CMD:{e.get('command','')}"),
                     ("[ADV-2] SQLITE FREELIST RECOVERED", self.freelist_entries,
@@ -1543,8 +1628,13 @@ class HisLiLoggerApp:
         for tree in [self.shell_tree, self.recent_tree, self.browser_tree, self.kw_tree,
                      self.procfd_tree, self.freelist_tree, self.thumb_tree, self.journal_tree]:
             self._clear_tree(tree)
-        self.shell_entries=self.recent_entries=self.browser_entries=[]
-        self.proc_fd_entries=self.freelist_entries=self.thumbnail_entries=self.journal_entries=[]
+        self.shell_entries = []
+        self.recent_entries = []
+        self.browser_entries = []
+        self.proc_fd_entries = []
+        self.freelist_entries = []
+        self.thumbnail_entries = []
+        self.journal_entries = []
         self.keyword_dict={}
         self.kw_stats.set("No keywords extracted yet.")
         self._set_status("Cleared. Ready.")
